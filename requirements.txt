@@ -1,0 +1,21 @@
+# HTTP y API
+requests==2.31.0
+
+# Caché
+redis==5.0.4
+
+# Variables de entorno
+python-dotenv==1.0.1
+
+# Web UI
+flask==3.0.3
+flask-cors==4.0.0
+
+# Telegram Bot
+python-telegram-bot==21.3
+
+# Alexa SDK (Lambda y tests locales)
+ask-sdk-core==1.19.0
+
+# Scheduler en Python (alternativa/complemento a cron del sistema)
+schedule==1.2.1

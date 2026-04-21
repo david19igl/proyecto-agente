@@ -1,0 +1,144 @@
+version: "3.9"
+
+# =============================================================================
+# Agente Inteligente de Películas — Docker Compose
+#
+# Servicios:
+#   redis        → caché compartida entre todos los servicios
+#   scraper      → cron semanal (lunes 09:00) + punto de entrada CLI
+#   web          → interfaz web Flask en http://localhost:5000
+#   telegram_bot → bot de Telegram con comandos interactivos
+#
+# Inicio rápido:
+#   cp .env.example .env    # rellenar variables
+#   docker compose up --build
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Redis — caché compartida
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: movies_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - movies_net
+
+  # ---------------------------------------------------------------------------
+  # Scraper + Cron
+  # Ejecución automática lunes 09:00.
+  # Uso manual: docker compose exec scraper python scraper/weekly_report.py
+  # ---------------------------------------------------------------------------
+  scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: movies_scraper
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - OMDB_API_KEY=${OMDB_API_KEY}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASS=${SMTP_PASS}
+      - NOTIFY_EMAIL=${NOTIFY_EMAIL}
+      - CACHE_TTL=${CACHE_TTL:-86400}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./scraper:/app/scraper
+      - ./logs:/app/logs
+    # Instala el cron con el schedule del .env y lo arranca en primer plano
+    command: >
+      sh -c "
+        echo '${CRON_SCHEDULE}' | crontab - &&
+        cron -f &
+        tail -f /app/logs/cron.log 2>/dev/null || sleep infinity
+      "
+    networks:
+      - movies_net
+
+  # ---------------------------------------------------------------------------
+  # Web — Flask en http://localhost:5000
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: movies_web
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "5000:5000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - OMDB_API_KEY=${OMDB_API_KEY}
+      - FLASK_ENV=${FLASK_ENV:-production}
+      - SECRET_KEY=${SECRET_KEY:-changeme_in_production}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./web:/app/web
+      - ./scraper:/app/scraper
+    command: ["python", "web/app.py"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - movies_net
+
+  # ---------------------------------------------------------------------------
+  # Telegram Bot
+  # ---------------------------------------------------------------------------
+  telegram_bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: movies_telegram
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - OMDB_API_KEY=${OMDB_API_KEY}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./telegram_bot:/app/telegram_bot
+      - ./scraper:/app/scraper
+    command: ["python", "telegram_bot/bot.py"]
+    networks:
+      - movies_net
+
+# =============================================================================
+# Volúmenes y red
+# =============================================================================
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  movies_net:
+    driver: bridge

@@ -1,0 +1,16 @@
+# 1. Credenciales y secretos (¡CRÍTICO!)
+.env
+
+# 2. Archivos temporales de Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+env/
+
+# 3. Datos locales y caché
+cache_peliculas.json
+
+# 4. Logs del sistema y de Docker
+logs/
+*.log
