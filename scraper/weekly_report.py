@@ -1,9 +1,23 @@
 """
 weekly_report.py — Reporte semanal de cartelera de Madrid
-Ejecutado automáticamente por cron cada lunes a las 09:00.
-También puede lanzarse manualmente:
+Se ejecuta automáticamente cada lunes a las 09:00 via cron.
+También se puede lanzar manualmente:
   python scraper/weekly_report.py
   docker compose exec scraper python scraper/weekly_report.py
+
+CÓMO FUNCIONA EL FILTRADO:
+  Las preferencias se guardan en data/user_prefs.json.
+  Campos disponibles:
+    min_rating  (float) — nota mínima de IMDB, ej: 7.0
+    genres      (list)  — géneros preferidos, ej: ["Drama", "Action"]
+    directors   (list)  — directores favoritos, ej: ["Nolan", "Villeneuve"]
+    notify_method (str) — "telegram" o "email"
+
+  Una película pasa el filtro si cumple TODAS las condiciones activas.
+  Si un campo está vacío o es 0, ese filtro no se aplica.
+
+  Ejemplo: min_rating=7.0, genres=["Drama"]
+    → Solo películas con nota >= 7 Y de género Drama.
 """
 
 import os
@@ -14,18 +28,20 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
-from typing import Optional
 
-# Añadir la raíz del proyecto al path para importar módulos hermanos
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from dotenv import load_dotenv
-
 load_dotenv()
 
-# Importar scrapers del mismo paquete
 from scraper.scraper_imdb      import get_movie_info
 from scraper.scraper_cartelera import get_cartelera_madrid
+
+# ---------------------------------------------------------------------------
+# Logging con salida a consola y archivo
+# ---------------------------------------------------------------------------
+
+os.makedirs(os.path.join(os.path.dirname(__file__), "..", "logs"), exist_ok=True)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -41,28 +57,34 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Preferencias de usuario (guardadas en JSON local)
+# Preferencias de usuario
 # ---------------------------------------------------------------------------
 
 PREFS_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "user_prefs.json")
 
+DEFAULT_PREFS = {
+    "min_rating":    0.0,    # 0 = sin filtro de nota
+    "genres":        [],     # [] = todos los géneros
+    "directors":     [],     # [] = todos los directores
+    "notify_method": "telegram",
+}
+
 
 def load_prefs() -> dict:
-    """Carga las preferencias del usuario desde el archivo JSON."""
-    default = {
-        "min_rating":     0.0,    # nota mínima (0 = sin filtro)
-        "genres":         [],     # géneros preferidos, ej. ["Action", "Drama"]
-        "directors":      [],     # directores favoritos, ej. ["Nolan"]
-        "notify_method":  "telegram",  # "telegram" o "email"
-    }
     try:
         if os.path.exists(PREFS_FILE):
             with open(PREFS_FILE, encoding="utf-8") as f:
                 saved = json.load(f)
-                return {**default, **saved}
+                return {**DEFAULT_PREFS, **saved}
     except (json.JSONDecodeError, OSError) as e:
-        log.warning("No se pudieron cargar preferencias: %s. Usando valores por defecto.", e)
-    return default
+        log.warning("No se cargaron preferencias: %s. Usando valores por defecto.", e)
+
+    # El archivo no existe todavía: crearlo con los valores por defecto
+    # para que el usuario pueda editarlo fácilmente
+    prefs = DEFAULT_PREFS.copy()
+    save_prefs(prefs)
+    log.info("Creado data/user_prefs.json con valores por defecto")
+    return prefs
 
 
 def save_prefs(prefs: dict) -> None:
@@ -71,42 +93,70 @@ def save_prefs(prefs: dict) -> None:
         json.dump(prefs, f, ensure_ascii=False, indent=2)
 
 # ---------------------------------------------------------------------------
-# Filtrado
+# Filtrado de películas
+#
+# Cómo funciona:
+#   Para cada película ya enriquecida con OMDb, se comprueba:
+#     1. Si min_rating > 0  → la nota IMDB debe ser >= min_rating
+#     2. Si genres no vacío → al menos uno de esos géneros debe aparecer
+#        en el campo "genre" que devuelve OMDb (comparación insensible a mayúsculas)
+#     3. Si directors no vacío → al menos uno de esos directores debe aparecer
+#        en el campo "director" que devuelve OMDb
+#
+#   Los filtros son ACUMULATIVOS (AND): una película debe cumplir todos
+#   los que estén activos para aparecer en el reporte.
+#
+# Ejemplo práctico:
+#   prefs = {"min_rating": 7.5, "genres": ["Thriller"], "directors": []}
+#   → Muestra solo películas con nota >= 7.5 y de género Thriller.
+#   → El filtro de director está desactivado (lista vacía).
 # ---------------------------------------------------------------------------
 
 def apply_filters(movies: list[dict], prefs: dict) -> list[dict]:
-    """
-    Filtra la lista de películas enriquecidas según las preferencias del usuario.
-    movies: lista de dicts con datos fusionados de cartelera + OMDb.
-    """
-    filtered = []
     min_rating = prefs.get("min_rating", 0.0)
-    genres     = [g.lower() for g in prefs.get("genres", [])]
-    directors  = [d.lower() for d in prefs.get("directors", [])]
+    genres     = [g.lower().strip() for g in prefs.get("genres", []) if g.strip()]
+    directors  = [d.lower().strip() for d in prefs.get("directors", []) if d.strip()]
 
+    # Mostrar qué filtros están activos
+    active = []
+    if min_rating > 0:
+        active.append(f"nota >= {min_rating}")
+    if genres:
+        active.append(f"géneros: {genres}")
+    if directors:
+        active.append(f"directores: {directors}")
+    if active:
+        log.info("Filtros activos: %s", " | ".join(active))
+    else:
+        log.info("Sin filtros: se incluyen todas las películas")
+
+    filtered = []
     for movie in movies:
-        imdb_data = movie.get("imdb", {})
-        rating    = imdb_data.get("rating") or 0.0
+        imdb   = movie.get("imdb", {})
+        rating = imdb.get("rating") or 0.0
 
-        # Filtro por nota mínima
+        # Filtro 1: nota mínima
         if min_rating > 0 and rating < min_rating:
+            log.debug("  Descartada '%s' (nota %.1f < %.1f)", movie["title"], rating, min_rating)
             continue
 
-        # Filtro por género (OR: basta con que coincida uno)
+        # Filtro 2: género (basta con que uno coincida)
         if genres:
-            movie_genres = imdb_data.get("genre", "").lower()
-            if not any(g in movie_genres for g in genres):
+            movie_genre = imdb.get("genre", "").lower()
+            if not any(g in movie_genre for g in genres):
+                log.debug("  Descartada '%s' (género '%s' no en %s)", movie["title"], movie_genre, genres)
                 continue
 
-        # Filtro por director (OR)
+        # Filtro 3: director (basta con que uno coincida)
         if directors:
-            movie_director = imdb_data.get("director", "").lower()
+            movie_director = imdb.get("director", "").lower()
             if not any(d in movie_director for d in directors):
+                log.debug("  Descartada '%s' (director '%s' no en %s)", movie["title"], movie_director, directors)
                 continue
 
         filtered.append(movie)
 
-    log.info("Películas tras filtrado: %d/%d", len(filtered), len(movies))
+    log.info("Películas tras filtrado: %d / %d", len(filtered), len(movies))
     return filtered
 
 # ---------------------------------------------------------------------------
@@ -114,39 +164,32 @@ def apply_filters(movies: list[dict], prefs: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def build_report(movies: list[dict], prefs: dict) -> tuple[str, str]:
-    """
-    Construye el texto del reporte en dos formatos:
-      - Markdown (para Telegram)
-      - Texto plano (para email)
-    Devuelve (markdown, plain_text).
-    """
+    """Devuelve (texto_markdown_telegram, texto_plano_email)."""
     date_str = datetime.now().strftime("%d/%m/%Y")
-    total    = len(movies)
 
-    # Cabecera
-    md_lines   = [f"🎬 *Cartelera de Madrid — {date_str}*\n_{total} películas en cartelera_\n"]
-    txt_lines  = [f"CARTELERA DE MADRID — {date_str}", f"{total} películas en cartelera", "="*50]
+    md_lines  = [f"🎬 *Cartelera Madrid — {date_str}*\n_{len(movies)} películas_\n"]
+    txt_lines = [f"CARTELERA MADRID — {date_str}", f"{len(movies)} películas", "="*50]
 
-    # Filtros activos
-    if prefs.get("min_rating") or prefs.get("genres") or prefs.get("directors"):
-        filters_txt = []
-        if prefs.get("min_rating"):
-            filters_txt.append(f"Nota ≥ {prefs['min_rating']}")
-        if prefs.get("genres"):
-            filters_txt.append(f"Géneros: {', '.join(prefs['genres'])}")
-        if prefs.get("directors"):
-            filters_txt.append(f"Directores: {', '.join(prefs['directors'])}")
-        filtro_str = " | ".join(filters_txt)
-        md_lines.append(f"_Filtros: {filtro_str}_\n")
-        txt_lines.append(f"Filtros: {filtro_str}")
-        txt_lines.append("="*50)
+    # Resumen de filtros aplicados
+    filtros = []
+    if prefs.get("min_rating"):
+        filtros.append(f"Nota ≥ {prefs['min_rating']}")
+    if prefs.get("genres"):
+        filtros.append(f"Géneros: {', '.join(prefs['genres'])}")
+    if prefs.get("directors"):
+        filtros.append(f"Directores: {', '.join(prefs['directors'])}")
+    if filtros:
+        linea = " | ".join(filtros)
+        md_lines.append(f"_Filtros: {linea}_\n")
+        txt_lines.append(f"Filtros: {linea}")
 
     if not movies:
-        md_lines.append("_No hay películas que coincidan con tus preferencias esta semana._")
-        txt_lines.append("\nNo hay películas que coincidan con tus preferencias esta semana.")
+        msg = "No hay películas que coincidan con tus preferencias esta semana."
+        md_lines.append(f"_{msg}_")
+        txt_lines.append(f"\n{msg}")
         return "\n".join(md_lines), "\n".join(txt_lines)
 
-    # Películas ordenadas por nota IMDB (descendente)
+    # Ordenar por nota IMDB descendente
     sorted_movies = sorted(
         movies,
         key=lambda m: m.get("imdb", {}).get("rating") or 0,
@@ -154,41 +197,38 @@ def build_report(movies: list[dict], prefs: dict) -> tuple[str, str]:
     )
 
     for i, movie in enumerate(sorted_movies, 1):
-        imdb    = movie.get("imdb", {})
-        title   = imdb.get("title") or movie.get("title", "Desconocida")
-        year    = imdb.get("year", "")
-        rating  = imdb.get("rating")
+        imdb     = movie.get("imdb", {})
+        title    = imdb.get("title") or movie["title"]
+        year     = imdb.get("year", "")
+        rating   = imdb.get("rating")
         director = imdb.get("director", "N/D")
         duration = imdb.get("duration", "N/D")
-        genre    = imdb.get("genre", movie.get("genre", "N/D"))
-        synopsis = imdb.get("synopsis", "Sin sinopsis disponible")
-        cinemas  = movie.get("cinemas", [])
+        genre    = imdb.get("genre") or movie.get("genre", "N/D")
+        synopsis = imdb.get("synopsis", "Sin sinopsis")
 
-        rating_str = f"⭐ {rating}/10" if rating else "Sin nota"
-        cinemas_str = ", ".join(cinemas[:3]) + ("..." if len(cinemas) > 3 else "") if cinemas else "Ver cines en ecartelera.com"
+        rating_str = f"⭐ {rating}/10" if rating else "Sin nota en IMDB"
 
-        # Markdown (Telegram)
+        # Truncar sinopsis a 200 caracteres
+        synopsis_short = (synopsis[:197] + "...") if len(synopsis) > 200 else synopsis
+
+        # Formato Markdown para Telegram
         md_lines.append(
             f"*{i}. {title}* ({year})\n"
-            f"{rating_str} | {duration} | {genre}\n"
-            f"Director: {director}\n"
-            f"_{synopsis[:200]}{'...' if len(synopsis) > 200 else ''}_\n"
-            f"📍 {cinemas_str}\n"
+            f"{rating_str} · {duration} · {genre}\n"
+            f"🎬 {director}\n"
+            f"_{synopsis_short}_\n"
         )
 
-        # Texto plano (email)
+        # Formato texto plano para email
         txt_lines.append(
             f"\n{i}. {title} ({year})\n"
             f"   Nota: {rating_str} | Duración: {duration}\n"
-            f"   Género: {genre}\n"
-            f"   Director: {director}\n"
-            f"   Sinopsis: {synopsis[:200]}{'...' if len(synopsis) > 200 else ''}\n"
-            f"   Cines: {cinemas_str}"
+            f"   Género: {genre} | Director: {director}\n"
+            f"   Sinopsis: {synopsis_short}"
         )
 
-    md_lines.append("\n_Generado automáticamente por el Agente de Películas_")
-    txt_lines.append("\n" + "="*50)
-    txt_lines.append("Generado automáticamente por el Agente de Películas")
+    md_lines.append("_Generado por el Agente de Películas_")
+    txt_lines.append("\n" + "="*50 + "\nGenerado por el Agente de Películas")
 
     return "\n".join(md_lines), "\n".join(txt_lines)
 
@@ -199,32 +239,25 @@ def build_report(movies: list[dict], prefs: dict) -> tuple[str, str]:
 def send_telegram(text: str) -> bool:
     token   = os.getenv("TELEGRAM_TOKEN", "")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-
     if not token or not chat_id:
-        log.warning("TELEGRAM_TOKEN o TELEGRAM_CHAT_ID no configurados")
+        log.warning("TELEGRAM_TOKEN o TELEGRAM_CHAT_ID no configurados en .env")
         return False
-
     try:
         import telegram
         import asyncio
 
         async def _send():
-            bot = telegram.Bot(token=token)
-            # Telegram limita los mensajes a 4096 caracteres
+            bot    = telegram.Bot(token=token)
+            # Telegram limita mensajes a 4096 caracteres: dividir si es necesario
             chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
             for chunk in chunks:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=chunk,
-                    parse_mode="Markdown",
-                )
+                await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="Markdown")
 
         asyncio.run(_send())
-        log.info("Reporte enviado por Telegram a chat_id=%s", chat_id)
+        log.info("Reporte enviado por Telegram (chat_id=%s)", chat_id)
         return True
-
     except Exception as e:
-        log.error("Error enviando por Telegram: %s", e)
+        log.error("Error enviando Telegram: %s", e)
         return False
 
 # ---------------------------------------------------------------------------
@@ -232,32 +265,27 @@ def send_telegram(text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def send_email(subject: str, body: str) -> bool:
-    smtp_host   = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    smtp_port   = int(os.getenv("SMTP_PORT", 587))
-    smtp_user   = os.getenv("SMTP_USER", "")
-    smtp_pass   = os.getenv("SMTP_PASS", "")
-    notify_email = os.getenv("NOTIFY_EMAIL", "")
-
-    if not all([smtp_user, smtp_pass, notify_email]):
-        log.warning("Credenciales de email no configuradas")
+    host  = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    port  = int(os.getenv("SMTP_PORT", 587))
+    user  = os.getenv("SMTP_USER", "")
+    pwd   = os.getenv("SMTP_PASS", "")
+    dest  = os.getenv("NOTIFY_EMAIL", "")
+    if not all([user, pwd, dest]):
+        log.warning("Credenciales de email no configuradas en .env")
         return False
-
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
-        msg["From"]    = smtp_user
-        msg["To"]      = notify_email
+        msg["From"]    = user
+        msg["To"]      = dest
         msg.attach(MIMEText(body, "plain", "utf-8"))
-
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(smtp_user, smtp_pass)
-            server.sendmail(smtp_user, notify_email, msg.as_string())
-
-        log.info("Reporte enviado por email a %s", notify_email)
+        with smtplib.SMTP(host, port) as s:
+            s.ehlo()
+            s.starttls()
+            s.login(user, pwd)
+            s.sendmail(user, dest, msg.as_string())
+        log.info("Reporte enviado por email a %s", dest)
         return True
-
     except Exception as e:
         log.error("Error enviando email: %s", e)
         return False
@@ -269,56 +297,57 @@ def send_email(subject: str, body: str) -> bool:
 def run_weekly_report() -> None:
     log.info("=== Iniciando reporte semanal ===")
 
-    # 1. Cargar preferencias
+    # 1. Preferencias
     prefs = load_prefs()
-    log.info("Preferencias: %s", prefs)
+    log.info("Preferencias cargadas: %s", prefs)
 
-    # 2. Obtener cartelera de Madrid
-    cartelera = get_cartelera_madrid(with_details=False)
+    # 2. Cartelera de Madrid
+    cartelera = get_cartelera_madrid()
     if not cartelera:
         log.error("No se pudo obtener la cartelera. Abortando.")
         return
+    log.info("Cartelera obtenida: %d películas", len(cartelera))
 
-    # 3. Enriquecer con datos de OMDb (rating, sinopsis, director...)
-    log.info("Enriqueciendo %d películas con datos de OMDb...", len(cartelera))
+    # 3. Enriquecer con OMDb — solo títulos válidos (longitud razonable)
+    log.info("Enriqueciendo con OMDb API...")
     enriched = []
     for movie in cartelera:
-        imdb_data = get_movie_info(movie["title"])
+        title = movie["title"]
+
+        # Guardia extra: descartar si el título sigue pareciendo basura
+        if len(title) < 2 or len(title) > 80:
+            log.debug("Título ignorado (longitud inválida): '%s'", title)
+            continue
+
+        imdb_data = get_movie_info(title)
         if "error" not in imdb_data:
             movie["imdb"] = imdb_data
-            enriched.append(movie)
         else:
-            # Incluir igualmente aunque no tenga datos de OMDb
+            log.debug("Sin datos OMDb para '%s'", title)
             movie["imdb"] = {}
-            enriched.append(movie)
-            log.debug("Sin datos OMDb para '%s'", movie["title"])
+        enriched.append(movie)
 
-    # 4. Filtrar según preferencias del usuario
+    # 4. Filtrar según preferencias
     filtered = apply_filters(enriched, prefs)
 
-    # 5. Construir el reporte
+    # 5. Construir reporte
     md_text, plain_text = build_report(filtered, prefs)
 
-    # 6. Enviar por el método configurado
-    method = prefs.get("notify_method", "telegram")
+    # 6. Enviar
+    method   = prefs.get("notify_method", "telegram")
     date_str = datetime.now().strftime("%d/%m/%Y")
 
     if method == "telegram":
         ok = send_telegram(md_text)
     else:
-        ok = send_email(f"Cartelera de Madrid — {date_str}", plain_text)
+        ok = send_email(f"Cartelera Madrid — {date_str}", plain_text)
 
     if ok:
-        log.info("=== Reporte semanal completado con éxito ===")
+        log.info("=== Reporte semanal enviado con éxito ===")
     else:
-        log.error("=== El reporte no pudo enviarse ===")
-        # Imprimir en stdout como fallback
+        log.warning("No se pudo enviar. Mostrando en consola:\n")
         print(plain_text)
 
-
-# ---------------------------------------------------------------------------
-# CLI / Cron
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     run_weekly_report()

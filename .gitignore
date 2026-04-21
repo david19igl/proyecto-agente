@@ -12,5 +12,7 @@ env/
 cache_peliculas.json
 
 # 4. Logs del sistema y de Docker
-logs/
-*.log
+data/*
+!data/.gitkeep
+logs/*
+!logs/.gitkeep

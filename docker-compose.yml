@@ -64,6 +64,7 @@ services:
     volumes:
       - ./scraper:/app/scraper
       - ./logs:/app/logs
+      - ./data:/app/data     # persiste user_prefs.json entre reinicios
     # Instala el cron con el schedule del .env y lo arranca en primer plano
     command: >
       sh -c "
@@ -127,6 +128,7 @@ services:
     volumes:
       - ./telegram_bot:/app/telegram_bot
       - ./scraper:/app/scraper
+      - ./data:/app/data     # comparte user_prefs.json con el scraper
     command: ["python", "telegram_bot/bot.py"]
     networks:
       - movies_net

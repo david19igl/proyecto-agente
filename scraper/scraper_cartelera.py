@@ -1,12 +1,15 @@
 """
 scraper_cartelera.py — Cartelera de cine en Madrid desde ecartelera.com
 Uso: python scraper/scraper_cartelera.py [--json]
+
+URL correcta de ecartelera para Madrid ciudad:
+  https://www.ecartelera.com/cines/0,30,1.html
 """
 
 import os
+import re
 import json
 import logging
-import time
 from typing import Optional
 
 import requests
@@ -15,6 +18,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
+                    format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
 HEADERS = {
@@ -24,157 +29,176 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "es-ES,es;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-BASE_URL = "https://www.ecartelera.com"
-MADRID_URL = f"{BASE_URL}/cines/madrid/"
+BASE_URL      = "https://www.ecartelera.com"
+CARTELERA_URL = f"{BASE_URL}/cines/0,30,1.html"   # Madrid ciudad
+
+# ---------------------------------------------------------------------------
+# Validación de títulos
+# Evita que el fallback capture basura del HTML como "Películas" o "38 cines"
+# ---------------------------------------------------------------------------
+
+_BLACKLIST = {
+    "películas", "peliculas", "horarios", "cines", "cartelera",
+    "estrenos", "sesiones", "ver más", "ver mas", "más info",
+    "comprar", "entradas", "trailer", "tráiler", "sinopsis",
+    "género", "genero", "director", "actores", "inicio",
+    "contacto", "publicidad", "newsletter", "buscar", "inicio",
+}
+
+_JUNK_RE = re.compile(
+    r"^\d+\s*cines?$"    # "38 cines"
+    r"|^horarios"        # "Horarios: ..."
+    r"|^ver\s+"          # "Ver más"
+    r"|^\d+$"            # solo números
+    r"|^https?://"       # URLs
+    r"|.{81,}",          # más de 80 caracteres → no es un título
+    re.IGNORECASE,
+)
+
+
+def _is_valid_title(text: str) -> bool:
+    """Devuelve True si el texto parece un título de película real."""
+    if not text:
+        return False
+    t = text.strip()
+    if len(t) < 2:
+        return False
+    if t.lower() in _BLACKLIST:
+        return False
+    if _JUNK_RE.search(t):
+        return False
+    # Debe contener al menos una letra
+    if not re.search(r"[a-zA-ZáéíóúüñÁÉÍÓÚÜÑ]", t):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
-# Scraping
+# Parser del HTML de ecartelera
 # ---------------------------------------------------------------------------
 
-def fetch_cartelera_madrid() -> list[dict]:
+def _parse_html(html: str) -> list[dict]:
     """
-    Obtiene la lista de películas en cartelera en Madrid desde ecartelera.com.
-    Devuelve una lista de dicts con: title, url, genre, cinemas.
+    Extrae películas del HTML en tres estrategias, de más a menos fiable:
+      1. Selectores CSS de tarjeta conocidos
+      2. JSON-LD embebido (Schema.org)
+      3. Fallback: enlaces /peliculas/ con validación estricta
     """
-    log.info("Descargando cartelera de Madrid desde ecartelera.com...")
-
-    try:
-        resp = requests.get(MADRID_URL, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        log.error("Error al descargar la cartelera: %s", e)
-        return []
-
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup   = BeautifulSoup(html, "html.parser")
     movies = []
 
-    # ecartelera lista las películas en tarjetas con clase "movie-card" o similar
-    # Buscamos los enlaces a páginas de película dentro de la sección de cartelera
-    cards = soup.select("div.pelicula, article.movie, div.movie-item, li.pelicula")
+    # Estrategia 1 — selectores de tarjeta
+    CARD_SELECTORS = [
+        "div.pelicula-item", "div.movie-card", "article.pelicula",
+        "li.pelicula", "div.item-pelicula", "div.pelicula",
+    ]
+    for sel in CARD_SELECTORS:
+        cards = soup.select(sel)
+        if not cards:
+            continue
+        log.info("Selector '%s' encontró %d tarjetas", sel, len(cards))
+        for card in cards:
+            m = _card_data(card)
+            if m:
+                movies.append(m)
+        if movies:
+            return movies
 
-    # Fallback: buscar por estructura de enlaces si el selector principal no funciona
-    if not cards:
-        log.warning("Selector principal sin resultados, usando fallback...")
-        cards = soup.select("a[href*='/peliculas/']")
-        movies = _parse_links_fallback(cards)
+    # Estrategia 2 — JSON-LD embebido
+    for script in soup.find_all("script", {"type": "application/ld+json"}):
+        try:
+            data  = json.loads(script.string or "")
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if item.get("@type") in ("Movie", "ScreeningEvent"):
+                    title = item.get("name", "")
+                    if _is_valid_title(title):
+                        movies.append({
+                            "title":   title,
+                            "url":     item.get("url", ""),
+                            "genre":   item.get("genre", "No disponible"),
+                            "cinemas": [],
+                        })
+        except (json.JSONDecodeError, AttributeError):
+            continue
+    if movies:
+        log.info("JSON-LD encontró %d películas", len(movies))
         return movies
 
-    for card in cards:
-        movie = _parse_card(card)
-        if movie:
-            movies.append(movie)
-
-    log.info("Encontradas %d películas en cartelera", len(movies))
-    return movies
-
-
-def _parse_card(card) -> Optional[dict]:
-    """Extrae datos de una tarjeta de película."""
-    try:
-        # Título
-        title_el = card.select_one("h2, h3, .title, .titulo, a")
-        if not title_el:
-            return None
-        title = title_el.get_text(strip=True)
-        if not title:
-            return None
-
-        # URL de detalle
-        link_el = card.select_one("a[href]")
-        url = BASE_URL + link_el["href"] if link_el and link_el["href"].startswith("/") else ""
-
-        # Género (si aparece en la tarjeta)
-        genre_el = card.select_one(".genero, .genre, span.cat")
-        genre = genre_el.get_text(strip=True) if genre_el else "No disponible"
-
-        # Cines donde se proyecta
-        cinemas = []
-        cinema_els = card.select(".cine, .cinema, li.cine")
-        for c in cinema_els:
-            name = c.get_text(strip=True)
-            if name:
-                cinemas.append(name)
-
-        return {
-            "title":   title,
-            "url":     url,
-            "genre":   genre,
-            "cinemas": cinemas,
-        }
-    except Exception as e:
-        log.debug("Error parseando tarjeta: %s", e)
-        return None
-
-
-def _parse_links_fallback(links) -> list[dict]:
-    """Fallback: extrae títulos desde los enlaces /peliculas/ de la página."""
-    seen = set()
-    movies = []
+    # Estrategia 3 — fallback por enlaces /peliculas/ con validación estricta
+    log.warning("Usando fallback por enlaces /peliculas/ con filtros estrictos")
+    seen  = set()
+    links = soup.select("a[href*='/peliculas/']")
     for link in links:
         title = link.get_text(strip=True)
         href  = link.get("href", "")
-        if not title or title in seen:
+        if href.startswith("/"):
+            href = BASE_URL + href
+
+        if not _is_valid_title(title):
             continue
+        # El href debe ser una página de película concreta, no un listado
+        if not re.search(r"/peliculas/[\w-]+-\d+/", href):
+            continue
+        if title in seen:
+            continue
+
         seen.add(title)
-        movies.append({
-            "title":   title,
-            "url":     BASE_URL + href if href.startswith("/") else href,
-            "genre":   "No disponible",
-            "cinemas": [],
-        })
+        movies.append({"title": title, "url": href, "genre": "No disponible", "cinemas": []})
+
+    log.info("Fallback encontró %d películas válidas", len(movies))
     return movies
 
 
-def fetch_movie_detail(url: str) -> dict:
-    """
-    Visita la página de detalle de una película en ecartelera
-    para obtener los cines y horarios de Madrid.
-    """
-    if not url:
-        return {"cinemas": [], "showtimes": []}
-
-    time.sleep(0.5)  # pausa respetuosa entre peticiones
+def _card_data(card) -> Optional[dict]:
+    """Extrae título, URL y género de una tarjeta HTML."""
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        log.debug("Error al obtener detalle de %s: %s", url, e)
-        return {"cinemas": [], "showtimes": []}
+        title = ""
+        for sel in ["h2", "h3", "h4", ".titulo", ".title", "a"]:
+            el = card.select_one(sel)
+            if el:
+                candidate = el.get_text(strip=True)
+                if _is_valid_title(candidate):
+                    title = candidate
+                    break
+        if not title:
+            return None
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+        link = card.select_one("a[href]")
+        href = link["href"] if link else ""
+        url  = (BASE_URL + href) if href.startswith("/") else href
 
-    cinemas   = [el.get_text(strip=True) for el in soup.select(".cine-name, .nombre-cine, h3.cine")]
-    showtimes = [el.get_text(strip=True) for el in soup.select(".horario, .showtime, span.hora")]
+        genre_el = card.select_one(".genero, .genre, .categoria, span.cat")
+        genre    = genre_el.get_text(strip=True) if genre_el else "No disponible"
 
-    return {
-        "cinemas":   cinemas[:10],    # limitar a 10 cines
-        "showtimes": showtimes[:20],  # limitar a 20 horarios
-    }
+        return {"title": title, "url": url, "genre": genre, "cinemas": []}
+    except Exception as e:
+        log.debug("Error en tarjeta: %s", e)
+        return None
 
 
 # ---------------------------------------------------------------------------
 # Función pública
 # ---------------------------------------------------------------------------
 
-def get_cartelera_madrid(with_details: bool = False) -> list[dict]:
+def get_cartelera_madrid() -> list[dict]:
     """
-    Devuelve la cartelera completa de Madrid.
-
-    Si with_details=True, visita la página de cada película para obtener
-    cines y horarios (más lento, ~0.5s por película).
+    Devuelve la lista de películas en cartelera en Madrid.
+    Cada elemento tiene: title, url, genre, cinemas.
     """
-    movies = fetch_cartelera_madrid()
+    log.info("Descargando cartelera de Madrid desde ecartelera.com...")
+    try:
+        resp = requests.get(CARTELERA_URL, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        log.error("Error al descargar la cartelera: %s", e)
+        return []
 
-    if with_details:
-        log.info("Obteniendo detalles de %d películas...", len(movies))
-        for movie in movies:
-            detail = fetch_movie_detail(movie.get("url", ""))
-            movie["cinemas"]   = detail["cinemas"]   or movie.get("cinemas", [])
-            movie["showtimes"] = detail["showtimes"]
-
+    movies = _parse_html(resp.text)
+    log.info("Total películas obtenidas: %d", len(movies))
     return movies
 
 
@@ -184,12 +208,9 @@ def get_cartelera_madrid(with_details: bool = False) -> list[dict]:
 
 if __name__ == "__main__":
     import sys
-    logging.basicConfig(level="INFO", format="%(levelname)s: %(message)s")
-
     as_json = "--json" in sys.argv
-    detail  = "--detail" in sys.argv
 
-    cartelera = get_cartelera_madrid(with_details=detail)
+    cartelera = get_cartelera_madrid()
 
     if as_json:
         print(json.dumps(cartelera, ensure_ascii=False, indent=2))
@@ -197,7 +218,6 @@ if __name__ == "__main__":
         print(f"\nCartelera de Madrid — {len(cartelera)} películas\n{'='*45}")
         for m in cartelera:
             print(f"\n  {m['title']}")
-            print(f"  Género : {m['genre']}")
-            if m.get("cinemas"):
-                print(f"  Cines  : {', '.join(m['cinemas'][:3])}")
+            if m["genre"] != "No disponible":
+                print(f"  Género : {m['genre']}")
         print()
