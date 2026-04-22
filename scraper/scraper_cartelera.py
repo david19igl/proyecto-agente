@@ -1,9 +1,6 @@
 """
 scraper_cartelera.py — Cartelera de cine en Madrid desde ecartelera.com
 Uso: python scraper/scraper_cartelera.py [--json]
-
-URL correcta de ecartelera para Madrid ciudad:
-  https://www.ecartelera.com/cines/0,30,1.html
 """
 
 import os
@@ -36,8 +33,7 @@ BASE_URL      = "https://www.ecartelera.com"
 CARTELERA_URL = f"{BASE_URL}/cines/0,30,1.html"   # Madrid ciudad
 
 # ---------------------------------------------------------------------------
-# Validación de títulos
-# Evita que el fallback capture basura del HTML como "Películas" o "38 cines"
+# Validación de títulos — evita capturar texto de navegación como título
 # ---------------------------------------------------------------------------
 
 _BLACKLIST = {
@@ -45,22 +41,28 @@ _BLACKLIST = {
     "estrenos", "sesiones", "ver más", "ver mas", "más info",
     "comprar", "entradas", "trailer", "tráiler", "sinopsis",
     "género", "genero", "director", "actores", "inicio",
-    "contacto", "publicidad", "newsletter", "buscar", "inicio",
+    "contacto", "publicidad", "newsletter", "buscar",
+}
+
+# Slugs de categoría que no son películas individuales
+_SLUG_BLACKLIST = {
+    "comedia", "drama", "accion", "terror", "thriller",
+    "aventura", "animacion", "documental", "infantil",
+    "romantica", "ciencia-ficcion", "fantasia",
 }
 
 _JUNK_RE = re.compile(
-    r"^\d+\s*cines?$"    # "38 cines"
-    r"|^horarios"        # "Horarios: ..."
-    r"|^ver\s+"          # "Ver más"
-    r"|^\d+$"            # solo números
-    r"|^https?://"       # URLs
-    r"|.{81,}",          # más de 80 caracteres → no es un título
+    r"^\d+\s*cines?$"   # "38 cines"
+    r"|^horarios"       # "Horarios: ..."
+    r"|^ver\s+"         # "Ver más"
+    r"|^\d+$"           # solo números
+    r"|^https?://"      # URLs
+    r"|.{81,}",         # más de 80 caracteres
     re.IGNORECASE,
 )
 
 
 def _is_valid_title(text: str) -> bool:
-    """Devuelve True si el texto parece un título de película real."""
     if not text:
         return False
     t = text.strip()
@@ -70,27 +72,26 @@ def _is_valid_title(text: str) -> bool:
         return False
     if _JUNK_RE.search(t):
         return False
-    # Debe contener al menos una letra
     if not re.search(r"[a-zA-ZáéíóúüñÁÉÍÓÚÜÑ]", t):
         return False
     return True
 
 
 # ---------------------------------------------------------------------------
-# Parser del HTML de ecartelera
+# Parser del HTML
 # ---------------------------------------------------------------------------
 
 def _parse_html(html: str) -> list[dict]:
     """
-    Extrae películas del HTML en tres estrategias, de más a menos fiable:
-      1. Selectores CSS de tarjeta conocidos
+    Extrae películas del HTML en tres estrategias:
+      1. Selectores CSS de tarjeta
       2. JSON-LD embebido (Schema.org)
-      3. Fallback: enlaces /peliculas/ con validación estricta
+      3. Fallback: enlaces /peliculas/ con validación de slug
     """
     soup   = BeautifulSoup(html, "html.parser")
     movies = []
 
-    # Estrategia 1 — selectores de tarjeta
+    # Estrategia 1 — selectores de tarjeta conocidos en ecartelera
     CARD_SELECTORS = [
         "div.pelicula-item", "div.movie-card", "article.pelicula",
         "li.pelicula", "div.item-pelicula", "div.pelicula",
@@ -128,9 +129,14 @@ def _parse_html(html: str) -> list[dict]:
         log.info("JSON-LD encontró %d películas", len(movies))
         return movies
 
-    # Estrategia 3 — fallback por enlaces /peliculas/ con validación estricta
-    log.warning("Usando fallback por enlaces /peliculas/ con filtros estrictos")
-    seen  = set()
+    # Estrategia 3 — fallback por enlaces /peliculas/
+    # El patrón original exigía números al final del slug (/peliculas/titulo-1234/)
+    # pero ecartelera usa URLs limpias (/peliculas/scream-7/) sin números obligatorios.
+    # Ahora validamos por estructura de ruta en lugar de por expresión regular rígida.
+    log.warning("Usando fallback por enlaces /peliculas/")
+    seen_titles: set[str] = set()
+    seen_urls:   set[str] = set()
+
     links = soup.select("a[href*='/peliculas/']")
     for link in links:
         title = link.get_text(strip=True)
@@ -140,16 +146,36 @@ def _parse_html(html: str) -> list[dict]:
 
         if not _is_valid_title(title):
             continue
-        # El href debe ser una página de película concreta, no un listado
-        if not re.search(r"/peliculas/[\w-]+-\d+/", href):
-            continue
-        if title in seen:
+
+        # Descartar listados generales: la URL debe tener un slug de película real.
+        # Estructura esperada: /peliculas/<slug>/  (puede o no tener trailing slash)
+        path     = href.replace(BASE_URL, "").strip("/")
+        segments = [s for s in path.split("/") if s]
+
+        # Debe ser exactamente ["peliculas", "slug-de-pelicula"]
+        if len(segments) != 2 or segments[0] != "peliculas":
             continue
 
-        seen.add(title)
-        movies.append({"title": title, "url": href, "genre": "No disponible", "cinemas": []})
+        slug = segments[1]
 
-    log.info("Fallback encontró %d películas válidas", len(movies))
+        # El slug debe tener al menos 3 caracteres y no ser una categoría genérica
+        if len(slug) < 3 or slug in _SLUG_BLACKLIST:
+            continue
+
+        # Evitar duplicados por título y por URL
+        if title in seen_titles or href in seen_urls:
+            continue
+
+        seen_titles.add(title)
+        seen_urls.add(href)
+        movies.append({
+            "title":   title,
+            "url":     href,
+            "genre":   "No disponible",
+            "cinemas": [],
+        })
+
+    log.info("Fallback encontró %d películas", len(movies))
     return movies
 
 

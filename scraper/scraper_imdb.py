@@ -1,6 +1,6 @@
 """
 scraper_imdb.py — Scraper de películas usando OMDb API + caché Redis
-Uso: python scraper_imdb.py "Nombre de la película" [--json] [--compact]
+Uso: python scraper/scraper_imdb.py "Nombre de la película" [--json] [--compact]
 
 OMDb API (https://www.omdbapi.com):
   - 1000 peticiones/día gratis, sin bloqueos
@@ -10,6 +10,7 @@ OMDb API (https://www.omdbapi.com):
 import sys
 import json
 import os
+import re
 import logging
 import hashlib
 from typing import Optional
@@ -32,7 +33,7 @@ except ImportError:
 OMDB_API_KEY = os.getenv("OMDB_API_KEY", "")
 OMDB_BASE    = "https://www.omdbapi.com/"
 REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
-CACHE_TTL    = int(os.getenv("CACHE_TTL", 86400))   # 24h por defecto
+CACHE_TTL    = int(os.getenv("CACHE_TTL", 86400))
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
                     format="%(levelname)s: %(message)s")
@@ -83,12 +84,10 @@ def cache_set(title: str, data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _clean(val: str) -> str:
-    """Normaliza campos: devuelve 'No disponible' si OMDb retorna N/A."""
     return val if val and val.strip() not in ("N/A", "", "None") else "No disponible"
 
 
 def _omdb_request(params: dict) -> Optional[dict]:
-    """Petición genérica a OMDb. Devuelve el JSON o None si hay error."""
     if not OMDB_API_KEY:
         log.error("OMDB_API_KEY no configurada. Añádela al archivo .env")
         return None
@@ -109,34 +108,71 @@ def _omdb_request(params: dict) -> Optional[dict]:
         return None
 
 
+def _simplify_title(title: str) -> Optional[str]:
+    """
+    Genera un título simplificado para un segundo intento de búsqueda.
+    Útil para secuelas que OMDb no tiene con nombre exacto.
+    Ejemplos:
+      "El diablo viste de Prada 2"  → "El diablo viste de Prada"
+      "Noche de bodas 2"            → "Noche de bodas"
+      "La familia Benetón +2"       → "La familia Benetón"
+    """
+    t = title.strip()
+    # Quitar número de secuela al final: " 2", "+2", "II", etc.
+    simplified = re.sub(r"\s+[\+]?\d+$", "", t)
+    simplified = re.sub(
+        r"\s+(II|III|IV|V|VI|VII|VIII|IX|X)$", "", simplified, flags=re.IGNORECASE
+    ).strip()
+    return simplified if simplified != t and len(simplified) >= 2 else None
+
+
 def _search_omdb(title: str) -> Optional[dict]:
     """
-    Búsqueda en dos pasos:
-      1. Título exacto (parámetro t=)  → más preciso
-      2. Búsqueda libre (parámetro s=) → toma el primer resultado
+    Búsqueda en hasta tres pasos para maximizar coincidencias:
+      1. Título exacto (t=)
+      2. Búsqueda libre (s=) con el título original
+      3. Si el título parece secuela, repite con título simplificado
+    Esto es especialmente útil para:
+      - Películas españolas recientes que OMDb tiene en inglés
+      - Secuelas cuyo número exacto no está en OMDb todavía
     """
+    # Paso 1: título exacto
     data = _omdb_request({"t": title, "plot": "full"})
     if data:
         return data
 
+    # Paso 2: búsqueda libre con título original
     log.info("Título exacto no encontrado, probando búsqueda libre...")
     search = _omdb_request({"s": title, "type": "movie"})
-    if not search or not search.get("Search"):
-        return None
+    if search and search.get("Search"):
+        imdb_id = search["Search"][0].get("imdbID")
+        if imdb_id:
+            result = _omdb_request({"i": imdb_id, "plot": "full"})
+            if result:
+                return result
 
-    imdb_id = search["Search"][0].get("imdbID")
-    return _omdb_request({"i": imdb_id, "plot": "full"}) if imdb_id else None
+    # Paso 3: intentar con título simplificado (quitar número de secuela)
+    simplified = _simplify_title(title)
+    if simplified:
+        log.info("Probando con título simplificado: '%s'", simplified)
+        data = _omdb_request({"t": simplified, "plot": "full"})
+        if data:
+            return data
+        search = _omdb_request({"s": simplified, "type": "movie"})
+        if search and search.get("Search"):
+            imdb_id = search["Search"][0].get("imdbID")
+            if imdb_id:
+                return _omdb_request({"i": imdb_id, "plot": "full"})
+
+    return None
 
 
 def _parse(raw: dict) -> dict:
-    """Convierte la respuesta raw de OMDb al formato interno normalizado."""
     rating, votes = None, 0
-
     try:
         rating = float(raw.get("imdbRating", ""))
     except (ValueError, TypeError):
         pass
-
     try:
         votes = int(raw.get("imdbVotes", "0").replace(",", ""))
     except (ValueError, TypeError):
@@ -172,13 +208,7 @@ def _parse(raw: dict) -> dict:
 def get_movie_info(title: str) -> dict:
     """
     Devuelve información completa de una película dado su título.
-
-    Flujo: caché → OMDb API (exacto → libre) → error
-
-    Retorna un dict con las claves: title, year, rating, votes,
-    synopsis, director, duration, genre, actors, imdb_id, poster,
-    rt_score, metacritic, source.
-    O un dict {"error": "..."} si no se encuentra nada.
+    Flujo: caché → OMDb exacto → OMDb libre → OMDb simplificado → error
     """
     if not title or not title.strip():
         return {"error": "El título no puede estar vacío"}
@@ -200,7 +230,6 @@ def get_movie_info(title: str) -> dict:
 
 
 def format_for_display(data: dict, compact: bool = False) -> str:
-    """Formatea el resultado como texto para CLI o respuesta de Alexa."""
     if "error" in data:
         return f"Error: {data['error']}"
 
@@ -241,9 +270,9 @@ def format_for_display(data: dict, compact: bool = False) -> str:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print('Uso:  python scraper_imdb.py "Nombre de la película" [--json] [--compact]')
-        print('Ej.:  python scraper_imdb.py "Inception"')
-        print('Ej.:  python scraper_imdb.py "El Padrino" --json')
+        print('Uso:  python scraper/scraper_imdb.py "Nombre de la película" [--json] [--compact]')
+        print('Ej.:  python scraper/scraper_imdb.py "Inception"')
+        print('Ej.:  python scraper/scraper_imdb.py "El Padrino" --json')
         sys.exit(1)
 
     movie_title = sys.argv[1]
